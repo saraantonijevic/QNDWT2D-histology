@@ -1,0 +1,787 @@
+function T = MakeQNDWTSummary(rootIn, outDir, L, shift)
+% Status coding:
+%status = 0  Normal label n
+%status = 1  Benign label b
+%status = 2  InSitu label insitu
+%status = 3  Invasive label m
+%
+% Quaternion RGB coding:
+%   q(row,col) = 0 + R*i + G*j + B*k
+%
+% The transform is nondecimated. Images are not converted to grayscale and are not resized or cropped. Intensities are only normalized to [0,1].
+%
+
+if nargin < 1 || isempty(rootIn)
+    rootIn = 'C:\Brani2\WorkTAMU\Quaternion\OrigImages';
+end
+if nargin < 2 || isempty(outDir)
+    outDir = 'C:\Brani2\WorkTAMU\Quaternion\QNDWT';
+end
+if nargin < 3 || isempty(L)
+    L = 6;
+end
+if nargin < 4 || isempty(shift)
+    shift = 0;
+end
+
+if ~exist(rootIn, 'dir')
+    error('Input root folder does not exist: %s', rootIn);
+end
+if ~exist(outDir, 'dir')
+    mkdir(outDir);
+end
+
+classes = struct( ...
+    'folder', {'Normal', 'Benign', 'InSitu', 'Invasive'}, ...
+    'status', {0, 1, 2, 3}, ...
+    'label',  {'n', 'b', 'insitu', 'm'} );
+
+[h, g] = qfletcher10_local();
+
+rows = struct([]);
+nDone = 0;
+nFail = 0;
+
+fprintf('\nQuaternion NDWT feature extraction\n');
+fprintf('Input root : %s\n', rootIn);
+fprintf('Output dir : %s\n', outDir);
+fprintf('Requested levels: %d\n', L);
+fprintf('Shift: %d\n\n', shift);
+
+for c = 1:numel(classes)
+    folderPath = fullfile(rootIn, classes(c).folder);
+    files = list_image_files_local(folderPath);
+
+    fprintf('Folder %-8s | status %d | files found %d\n', ...
+        classes(c).folder, classes(c).status, numel(files));
+
+    for k = 1:numel(files)
+        row = init_empty_row_local(L);
+
+        fpath = fullfile(files(k).folder, files(k).name);
+        row.status = classes(c).status;
+        row.statusLabel = classes(c).label;
+        row.folder = classes(c).folder;
+        row.fileName = files(k).name;
+        row.filePath = fpath;
+        row.levelsRequested = L;
+        row.shift = shift;
+
+        try
+            Iraw = imread(fpath);
+            [Q, imageInfo, rgbStats] = image_to_pure_quaternion_local(Iraw);
+
+            row.height = imageInfo.height;
+            row.width = imageInfo.width;
+            row.channelsOriginal = imageInfo.channelsOriginal;
+            row.channelsUsed = imageInfo.channelsUsed;
+            row.maxIntensityOriginal = imageInfo.maxIntensityOriginal;
+            row.minIntensityOriginal = imageInfo.minIntensityOriginal;
+
+            row.mean_R = rgbStats.mean_R;
+            row.mean_G = rgbStats.mean_G;
+            row.mean_B = rgbStats.mean_B;
+            row.std_R = rgbStats.std_R;
+            row.std_G = rgbStats.std_G;
+            row.std_B = rgbStats.std_B;
+            row.corr_RG = rgbStats.corr_RG;
+            row.corr_RB = rgbStats.corr_RB;
+            row.corr_GB = rgbStats.corr_GB;
+
+            feats = extract_qndwt_features_local(Q, h, g, L, shift);
+            row = copy_fields_local(row, feats);
+            row.error = '';
+
+            nDone = nDone + 1;
+            fprintf('  ok   %5d  %s\n', nDone, files(k).name);
+
+        catch ME
+            nFail = nFail + 1;
+            row.error = ME.message;
+            fprintf('  FAIL        %s\n       %s\n', files(k).name, ME.message);
+        end
+
+        if isempty(rows)
+            rows = row;
+        else
+            rows(end+1,1) = row; %#ok<AGROW>
+        end
+    end
+end
+
+if isempty(rows)
+    warning('No images were found. No summary.csv was written.');
+    T = table();
+    return
+end
+
+T = struct2table(rows);
+summaryPath = fullfile(outDir, 'summary.csv');
+writetable(T, summaryPath);
+
+fprintf('\nFinished.\n');
+fprintf('Successful images: %d\n', nDone);
+fprintf('Failed images: %d\n', nFail);
+fprintf('Saved feature file:\n  %s\n\n', summaryPath);
+
+end
+
+
+
+function files = list_image_files_local(folderPath) %image listing and image coding
+
+if ~exist(folderPath, 'dir')
+    warning('Missing folder: %s', folderPath);
+    files = [];
+    return
+end
+
+exts = {'*.tif','*.tiff','*.png','*.jpg','*.jpeg','*.bmp'};
+files = [];
+
+for e = 1:numel(exts)
+    d = dir(fullfile(folderPath, exts{e}));
+    files = [files; d(:)]; %#ok<AGROW>
+end
+
+%if files are nested one level or deeper, try recursive search as well.
+for e = 1:numel(exts)
+    d = dir(fullfile(folderPath, '**', exts{e}));
+    if ~isempty(d)
+        files = unique_file_structs_local([files; d(:)]);
+    end
+end
+
+end
+
+function files = unique_file_structs_local(files)
+
+if isempty(files)
+    return
+end
+
+keys = cell(numel(files),1);
+for i = 1:numel(files)
+    keys{i} = fullfile(files(i).folder, files(i).name);
+end
+[~, ia] = unique(keys, 'stable');
+files = files(ia);
+
+end
+
+function [Q, imageInfo, rgbStats] = image_to_pure_quaternion_local(Iraw)
+
+imageInfo = struct();
+imageInfo.height = size(Iraw,1);
+imageInfo.width = size(Iraw,2);
+if ndims(Iraw) == 2
+    imageInfo.channelsOriginal = 1;
+else
+    imageInfo.channelsOriginal = size(Iraw,3);
+end
+
+imageInfo.minIntensityOriginal = double(min(Iraw(:)));
+imageInfo.maxIntensityOriginal = double(max(Iraw(:)));
+
+I = double(Iraw);
+
+if isinteger(Iraw)
+    I = I / double(intmax(class(Iraw)));
+else
+    mx = max(I(:));
+    if mx > 1
+        I = I / mx;
+    end
+end
+
+if ndims(I) == 2
+    % This is only a safeguard for accidental grayscale files; RGB files are kept as RGB and are never converted to grayscale.
+    I = cat(3, I, I, I);
+elseif size(I,3) >= 3
+    I = I(:,:,1:3);
+else
+    error('Unsupported image with %d channels.', size(I,3));
+end
+
+imageInfo.channelsUsed = size(I,3);
+
+R = I(:,:,1);
+G = I(:,:,2);
+B = I(:,:,3);
+
+Q = zeros(size(I,1), size(I,2), 4);
+Q(:,:,2) = R;
+Q(:,:,3) = G;
+Q(:,:,4) = B;
+
+rgbStats = struct();
+rgbStats.mean_R = mean(R(:));
+rgbStats.mean_G = mean(G(:));
+rgbStats.mean_B = mean(B(:));
+rgbStats.std_R = std(R(:));
+rgbStats.std_G = std(G(:));
+rgbStats.std_B = std(B(:));
+rgbStats.corr_RG = safe_corr_local(R(:), G(:));
+rgbStats.corr_RB = safe_corr_local(R(:), B(:));
+rgbStats.corr_GB = safe_corr_local(G(:), B(:));
+
+end
+
+function r = safe_corr_local(x, y)
+
+x = double(x(:));
+y = double(y(:));
+x = x - mean(x);
+y = y - mean(y);
+den = sqrt(sum(x.^2) * sum(y.^2));
+if den <= 0
+    r = 0;
+else
+    r = sum(x .* y) / den;
+end
+
+end
+
+%feature extraction core
+
+function feats = extract_qndwt_features_local(Q, h, g, L, shift)
+
+[m1, m2, ~] = size(Q);
+K = size(h,1);
+Luse = min(L, max_allowed_levels_local(min(m1,m2), K));
+
+if Luse < 1
+    error('Image is too small for the length-%d quaternion filter.', K);
+end
+
+feats = init_feature_fields_local(L);
+feats.levelsUsed = Luse;
+
+Acur = Q;
+
+E = struct();
+E.H = nan(L,1);
+E.V = nan(L,1);
+E.D = nan(L,1);
+E.S = nan(L,1);
+
+for lev = 1:Luse
+    gap = 2^(lev-1) - 1;
+    hlev = dilate_qfilter_local(h, gap);
+    glev = dilate_qfilter_local(g, gap);
+
+    AH = apply_right_q_local(Acur, hlev, shift);
+    AG = apply_right_q_local(Acur, glev, shift);
+
+    LL = apply_left_adjoint_q_local(AH, hlev, shift);
+    LH = apply_left_adjoint_q_local(AG, hlev, shift);% smooth rows, detail columns
+    HL = apply_left_adjoint_q_local(AH, glev, shift); % detail rows, smooth columns
+    HH = apply_left_adjoint_q_local(AG, glev, shift);% detail rows, detail columns
+
+    sH = subband_stats_local(HL);
+    sV = subband_stats_local(LH);
+    sD = subband_stats_local(HH);
+
+    E.H(lev) = sH.energy;
+    E.V(lev) = sV.energy;
+    E.D(lev) = sD.energy;
+    E.S(lev) = qenergy_local(LL);
+
+    feats = store_orientation_stats_local(feats, lev, 'H', sH);
+    feats = store_orientation_stats_local(feats, lev, 'V', sV);
+    feats = store_orientation_stats_local(feats, lev, 'D', sD);
+
+    Esum = E.H(lev) + E.V(lev) + E.D(lev);
+    feats.(sprintf('p_H_L%d', lev)) = E.H(lev) / (Esum + eps);
+    feats.(sprintf('p_V_L%d', lev)) = E.V(lev) / (Esum + eps);
+    feats.(sprintf('p_D_L%d', lev)) = E.D(lev) / (Esum + eps);
+    feats.(sprintf('A_HV_L%d', lev)) = (E.H(lev) - E.V(lev)) / (E.H(lev) + E.V(lev) + eps);
+    feats.(sprintf('A_D_L%d', lev)) = E.D(lev) / (Esum + eps);
+    feats.(sprintf('orientEntropy_L%d', lev)) = orientation_entropy_local([E.H(lev), E.V(lev), E.D(lev)]);
+
+    Acur = LL;
+
+    clear AH AG LL LH HL HH sH sV sD
+end
+
+feats.E_smooth_final = qenergy_local(Acur);
+feats.log2E_smooth_final = log2(max(feats.E_smooth_final, realmin));
+
+feats = store_global_summaries_local(feats, E, Luse);
+
+end
+
+function Lmax = max_allowed_levels_local(minSide, K)
+
+Lmax = 0;
+for lev = 1:50
+    filtLength = 1 + (K - 1) * 2^(lev-1);
+    if filtLength <= minSide
+        Lmax = lev;
+    else
+        return
+    end
+end
+
+end
+
+function feats = store_orientation_stats_local(feats, lev, orient, S)
+
+prefix = sprintf('%s_L%d', orient, lev);
+
+feats.(sprintf('E_%s', prefix)) = S.energy;
+feats.(sprintf('log2E_%s', prefix)) = log2(max(S.energy, realmin));
+
+feats.(sprintf('ampMean_%s', prefix)) = S.amp_mean;
+feats.(sprintf('ampStd_%s', prefix)) = S.amp_std;
+feats.(sprintf('ampSkew_%s', prefix)) = S.amp_skew;
+feats.(sprintf('ampKurt_%s', prefix)) = S.amp_kurt;
+feats.(sprintf('ampEntropy_%s', prefix)) = S.amp_entropy;
+
+feats.(sprintf('phaseMean_%s', prefix)) = S.phase_mean;
+feats.(sprintf('phaseConc_%s', prefix)) = S.phase_conc;
+feats.(sprintf('phaseVar_%s', prefix)) = S.phase_var;
+
+feats.(sprintf('axisConc_%s', prefix)) = S.axis_conc;
+feats.(sprintf('axisMean_i_%s', prefix)) = S.axis_mean(1);
+feats.(sprintf('axisMean_j_%s', prefix)) = S.axis_mean(2);
+feats.(sprintf('axisMean_k_%s', prefix)) = S.axis_mean(3);
+
+end
+
+function feats = store_global_summaries_local(feats, E, Luse)
+
+EH = E.H(1:Luse);
+EV = E.V(1:Luse);
+ED = E.D(1:Luse);
+ES = E.S(1:Luse);
+ET = EH + EV + ED;
+
+feats.sumE_H = sum(EH);
+feats.sumE_V = sum(EV);
+feats.sumE_D = sum(ED);
+feats.sumE_totalDetail = sum(ET);
+feats.meanE_smoothByLevel = mean(ES);
+
+feats.share_H = feats.sumE_H / (feats.sumE_totalDetail + eps);
+feats.share_V = feats.sumE_V / (feats.sumE_totalDetail + eps);
+feats.share_D = feats.sumE_D / (feats.sumE_totalDetail + eps);
+
+feats.specEntropy_H = spectral_entropy_local(EH);
+feats.specEntropy_V = spectral_entropy_local(EV);
+feats.specEntropy_D = spectral_entropy_local(ED);
+feats.specEntropy_totalDetail = spectral_entropy_local(ET);
+
+A_HV = (EH - EV) ./ (EH + EV + eps);
+A_D = ED ./ (ET + eps);
+
+Oent = nan(Luse,1);
+for lev = 1:Luse
+    Oent(lev) = orientation_entropy_local([EH(lev), EV(lev), ED(lev)]);
+end
+
+feats.meanA_HV = mean(A_HV);
+feats.stdA_HV = std(A_HV);
+feats.meanA_D = mean(A_D);
+feats.stdA_D = std(A_D);
+feats.meanOrientEntropy = mean(Oent);
+feats.stdOrientEntropy = std(Oent);
+
+if Luse >= 2
+    x = (1:Luse)';
+    feats.slope_H = polyfit_slope_local(x, log2(max(EH(:), realmin)));
+    feats.slope_V = polyfit_slope_local(x, log2(max(EV(:), realmin)));
+    feats.slope_D = polyfit_slope_local(x, log2(max(ED(:), realmin)));
+    feats.slope_totalDetail = polyfit_slope_local(x, log2(max(ET(:), realmin)));
+else
+    feats.slope_H = NaN;
+    feats.slope_V = NaN;
+    feats.slope_D = NaN;
+    feats.slope_totalDetail = NaN;
+end
+
+end
+
+function b = polyfit_slope_local(x, y)
+
+p = polyfit(x(:), y(:), 1);
+b = p(1);
+
+end
+
+function S = subband_stats_local(Qsub)
+
+scalar = Qsub(:,:,1);
+vec1 = Qsub(:,:,2);
+vec2 = Qsub(:,:,3);
+vec3 = Qsub(:,:,4);
+
+vnorm = sqrt(vec1.^2 + vec2.^2 + vec3.^2);
+amp = sqrt(scalar.^2 + vnorm.^2);
+
+S.energy = mean(amp(:).^2);
+S.amp_mean = mean(amp(:));
+S.amp_std = std(amp(:));
+[S.amp_skew, S.amp_kurt] = sample_skew_kurt_local(amp(:));
+S.amp_entropy = normalized_hist_entropy_local(amp(:), 64);
+
+theta = atan2(vnorm, scalar);
+w = amp;
+sw = sum(w(:)) + eps;
+
+C = sum(w(:) .* cos(theta(:))) / sw;
+Ssin = sum(w(:) .* sin(theta(:))) / sw;
+
+S.phase_mean = atan2(Ssin, C);
+S.phase_conc = sqrt(C.^2 + Ssin.^2);
+S.phase_var = 1 - S.phase_conc;
+
+u1 = zeros(size(vec1));
+u2 = zeros(size(vec2));
+u3 = zeros(size(vec3));
+
+mask = vnorm > 0;
+u1(mask) = vec1(mask) ./ vnorm(mask);
+u2(mask) = vec2(mask) ./ vnorm(mask);
+u3(mask) = vec3(mask) ./ vnorm(mask);
+
+ax1 = sum(w(:) .* u1(:)) / sw;
+ax2 = sum(w(:) .* u2(:)) / sw;
+ax3 = sum(w(:) .* u3(:)) / sw;
+
+S.axis_mean = [ax1, ax2, ax3];
+S.axis_conc = norm(S.axis_mean);
+
+end
+
+function Hn = spectral_entropy_local(Evec)
+
+p = Evec(:) / (sum(Evec(:)) + eps);
+p = p(p > 0);
+if isempty(p)
+    Hn = 0;
+else
+    Hn = -sum(p .* log(p)) / log(numel(Evec));
+end
+
+end
+
+function Hn = orientation_entropy_local(E3)
+
+p = E3(:) / (sum(E3(:)) + eps);
+p = p(p > 0);
+if isempty(p)
+    Hn = 0;
+else
+    Hn = -sum(p .* log(p)) / log(3);
+end
+
+end
+
+function [g1, b2] = sample_skew_kurt_local(x)
+
+x = x(:);
+mu = mean(x);
+xc = x - mu;
+s2 = mean(xc.^2);
+
+if s2 <= 0
+    g1 = 0;
+    b2 = 0;
+    return
+end
+
+s = sqrt(s2);
+g1 = mean((xc / s).^3);
+b2 = mean((xc / s).^4);
+
+end
+
+function Hn = normalized_hist_entropy_local(x, nbins)
+
+x = x(:);
+if isempty(x)
+    Hn = 0;
+    return
+end
+
+xmin = min(x);
+xmax = max(x);
+
+if xmax <= xmin
+    Hn = 0;
+    return
+end
+
+edges = linspace(xmin, xmax, nbins + 1);
+counts = histcounts(x, edges);
+p = counts / (sum(counts) + eps);
+p = p(p > 0);
+
+if isempty(p)
+    Hn = 0;
+else
+    Hn = -sum(p .* log(p)) / log(nbins);
+end
+
+end
+
+function E = qenergy_local(Q)
+
+tmp = sum(Q.^2, 3);
+E = mean(tmp(:));
+
+end
+
+
+function row = init_empty_row_local(L) %row and feature structure
+
+row = struct();
+
+row.status = NaN;
+row.statusLabel = '';
+row.folder = '';
+row.fileName = '';
+row.filePath = '';
+row.height = NaN;
+row.width = NaN;
+row.channelsOriginal = NaN;
+row.channelsUsed = NaN;
+row.minIntensityOriginal = NaN;
+row.maxIntensityOriginal = NaN;
+row.levelsRequested = L;
+row.levelsUsed = NaN;
+row.shift = NaN;
+
+row.mean_R = NaN;
+row.mean_G = NaN;
+row.mean_B = NaN;
+row.std_R = NaN;
+row.std_G = NaN;
+row.std_B = NaN;
+row.corr_RG = NaN;
+row.corr_RB = NaN;
+row.corr_GB = NaN;
+
+feat = init_feature_fields_local(L);
+row = copy_fields_local(row, feat);
+
+row.error = '';
+
+end
+
+function feats = init_feature_fields_local(L)
+
+feats = struct();
+
+feats.levelsUsed = NaN;
+
+for lev = 1:L
+    orients = {'H', 'V', 'D'};
+    for o = 1:numel(orients)
+        orient = orients{o};
+        prefix = sprintf('%s_L%d', orient, lev);
+
+        feats.(sprintf('E_%s', prefix)) = NaN;
+        feats.(sprintf('log2E_%s', prefix)) = NaN;
+
+        feats.(sprintf('ampMean_%s', prefix)) = NaN;
+        feats.(sprintf('ampStd_%s', prefix)) = NaN;
+        feats.(sprintf('ampSkew_%s', prefix)) = NaN;
+        feats.(sprintf('ampKurt_%s', prefix)) = NaN;
+        feats.(sprintf('ampEntropy_%s', prefix)) = NaN;
+
+        feats.(sprintf('phaseMean_%s', prefix)) = NaN;
+        feats.(sprintf('phaseConc_%s', prefix)) = NaN;
+        feats.(sprintf('phaseVar_%s', prefix)) = NaN;
+
+        feats.(sprintf('axisConc_%s', prefix)) = NaN;
+        feats.(sprintf('axisMean_i_%s', prefix)) = NaN;
+        feats.(sprintf('axisMean_j_%s', prefix)) = NaN;
+        feats.(sprintf('axisMean_k_%s', prefix)) = NaN;
+    end
+
+    feats.(sprintf('p_H_L%d', lev)) = NaN;
+    feats.(sprintf('p_V_L%d', lev)) = NaN;
+    feats.(sprintf('p_D_L%d', lev)) = NaN;
+    feats.(sprintf('A_HV_L%d', lev)) = NaN;
+    feats.(sprintf('A_D_L%d', lev)) = NaN;
+    feats.(sprintf('orientEntropy_L%d', lev)) = NaN;
+end
+
+feats.E_smooth_final = NaN;
+feats.log2E_smooth_final = NaN;
+feats.sumE_H = NaN;
+feats.sumE_V = NaN;
+feats.sumE_D = NaN;
+feats.sumE_totalDetail = NaN;
+feats.meanE_smoothByLevel = NaN;
+feats.share_H = NaN;
+feats.share_V = NaN;
+feats.share_D = NaN;
+feats.specEntropy_H = NaN;
+feats.specEntropy_V = NaN;
+feats.specEntropy_D = NaN;
+feats.specEntropy_totalDetail = NaN;
+feats.meanA_HV = NaN;
+feats.stdA_HV = NaN;
+feats.meanA_D = NaN;
+feats.stdA_D = NaN;
+feats.meanOrientEntropy = NaN;
+feats.stdOrientEntropy = NaN;
+feats.slope_H = NaN;
+feats.slope_V = NaN;
+feats.slope_D = NaN;
+feats.slope_totalDetail = NaN;
+
+end
+
+function a = copy_fields_local(a, b)
+
+fn = fieldnames(b);
+for i = 1:numel(fn)
+    a.(fn{i}) = b.(fn{i});
+end
+
+end
+
+% Quaternion nondecimated filtering
+%LL = H^* A H
+%LH = H^* A G
+%HL = G^* A H
+%HH = G^* A G
+
+function Y = apply_right_q_local(M, f, shift)
+% Computes M * F ; each filter tap multiplies pixels on the right
+
+Y = zeros(size(M));
+K = size(f,1);
+
+for r = 0:(K-1)
+    q = f(r+1,:);
+    if any(q ~= 0)
+        Ms = circshift(M, [0, -(shift+r), 0]);
+        Y = Y + qmul_right_scalar_local(Ms, q);
+    end
+end
+
+end
+
+function Y = apply_left_adjoint_q_local(M, f, shift)
+%computes F^* * M. Each conjugated filter tap multiplies pixels on the left
+
+
+Y = zeros(size(M));
+K = size(f,1);
+
+for r = 0:(K-1)
+    q = qconj_scalar_local(f(r+1,:));
+    if any(q ~= 0)
+        Ms = circshift(M, [-(shift+r), 0, 0]);
+        Y = Y + qmul_left_scalar_local(q, Ms);
+    end
+end
+
+end
+
+function filtd = dilate_qfilter_local(filt, gap)
+% Insert gap zero quaternion taps between adjacent taps.
+
+if gap < 1
+    filtd = filt;
+    return
+end
+
+K = size(filt,1);
+newlength = (gap + 1) * K - gap;
+filtd = zeros(newlength,4);
+filtd(1:(gap+1):newlength,:) = filt;
+
+end
+
+function qc = qconj_scalar_local(q)
+
+qc = [q(1), -q(2), -q(3), -q(4)];
+
+end
+
+function Y = qmul_right_scalar_local(X, q)
+% Right multiplication: X * q
+
+a = X(:,:,1);
+b = X(:,:,2);
+c = X(:,:,3);
+d = X(:,:,4);
+
+e = q(1);
+f = q(2);
+g = q(3);
+h = q(4);
+
+Y = zeros(size(X));
+Y(:,:,1) = a*e - b*f - c*g - d*h;
+Y(:,:,2) = a*f + b*e + c*h - d*g;
+Y(:,:,3) = a*g - b*h + c*e + d*f;
+Y(:,:,4) = a*h + b*g - c*f + d*e;
+
+end
+
+function Y = qmul_left_scalar_local(q, X)
+%left multiplication: q * X
+
+e = q(1);
+f = q(2);
+g = q(3);
+h = q(4);
+
+a = X(:,:,1);
+b = X(:,:,2);
+c = X(:,:,3);
+d = X(:,:,4);
+
+Y = zeros(size(X));
+Y(:,:,1) = e*a - f*b - g*c - h*d;
+Y(:,:,2) = e*b + f*a + g*d - h*c;
+Y(:,:,3) = e*c - f*d + g*a + h*b;
+Y(:,:,4) = e*d + f*c - g*b + h*a;
+
+end
+
+
+
+function [h, g] = qfletcher10_local() %Fletcher-10 quaternion filter
+% Fletcher-10 quaternion scaling and wavelet filters
+%rows are [a b c d] = a + b*i + c*j + d*k
+
+h = zeros(10,4);
+g = zeros(10,4);
+
+h(1,:) = [-0.0115088994, -0.0200400312,  0, 0];
+h(2,:) = [-0.0391302581,  0.0224723305,  0, 0.0166753392];
+h(3,:) = [ 0.0073656956,  0.2076972100,  0,  0.0500260177];
+h(4,:)= [ 0.2393851082,  0.1226724866,  0, 0.0166753392];
+h(5,:) = [ 0.5109951348, -0.3328019959,  0, -0.0833766962];
+h(6,:)= h(5,:);
+h(7,:)  = h(4,:);
+h(8,:)= h(3,:);
+h(9,:) = h(2,:);
+h(10,:)= h(1,:);
+
+g0 = [ 0.0115088994, -0.0193286077,  0.0007856106, -0.0052336021];
+g1 = [-0.0391302581, -0.0260294481, -0.0039280528, 0.0094926715];
+g2 = [-0.0073656956,  0.2133885981, 0.0062848845, 0.0081572006];
+g3 = [ 0.2393851082, -0.1226724866, 0, -0.0166753392];
+g4 = [-0.5109951348, -0.3427619251, -0.0109985479, -0.0101062662];
+
+g(1,:) = g0;
+g(2,:) = g1;
+g(3,:)  =  g2;
+g(4,:) = g3;
+g(5,:)  = g4;
+g(6,:) = -g4;
+g(7,:)= -g3;
+g(8,:)  = -g2;
+g(9,:) = -g1;
+g(10,:) = -g0;
+
+end
